@@ -61,14 +61,14 @@ pub struct TempoOpts {
     ///
     /// The transaction is only valid before this unix timestamp.
     /// Requires `--tempo.expiring-nonce`.
-    #[arg(long = "tempo.valid-before")]
+    #[arg(long = "tempo.valid-before", requires = "expiring_nonce")]
     pub valid_before: Option<u64>,
 
     /// Lower bound timestamp for Tempo expiring nonce transactions.
     ///
     /// The transaction is only valid after this unix timestamp.
     /// Requires `--tempo.expiring-nonce`.
-    #[arg(long = "tempo.valid-after")]
+    #[arg(long = "tempo.valid-after", requires = "expiring_nonce")]
     pub valid_after: Option<u64>,
 }
 
