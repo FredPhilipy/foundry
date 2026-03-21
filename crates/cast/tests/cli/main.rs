@@ -4939,3 +4939,80 @@ Error: Invalid hex calldata '0X1': odd number of digits
 
 "#]]);
 });
+
+// Test that --tempo.print-sponsor-hash computes and prints the sponsor hash then exits
+casttest!(cast_mktx_tempo_print_sponsor_hash, |_prj, cmd| {
+    let output = cmd
+        .args([
+            "mktx",
+            "--from",
+            "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+            "--private-key",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "--chain",
+            "1",
+            "--nonce",
+            "0",
+            "--gas-limit",
+            "21000",
+            "--gas-price",
+            "10000000000",
+            "--priority-gas-price",
+            "1000000000",
+            "--tempo.print-sponsor-hash",
+            "--tempo.fee-token",
+            "0x0000000000000000000000000000000000000001",
+            "0x0000000000000000000000000000000000000001",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy()
+        .trim()
+        .to_string();
+
+    // Should output a 0x-prefixed 32-byte hash (66 chars)
+    assert!(output.starts_with("0x"), "expected 0x prefix, got: {output}");
+    assert_eq!(output.len(), 66, "expected 66-char hash, got {}: {output}", output.len());
+});
+
+// Test that --tempo.expiring-nonce with --tempo.valid-before successfully constructs a transaction
+casttest!(cast_mktx_tempo_expiring_nonce, |_prj, cmd| {
+    cmd.args([
+        "mktx",
+        "--private-key",
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "--chain",
+        "1",
+        "--nonce",
+        "0",
+        "--gas-limit",
+        "21000",
+        "--gas-price",
+        "10000000000",
+        "--priority-gas-price",
+        "1000000000",
+        "--tempo.expiring-nonce",
+        "--tempo.valid-before",
+        "99999999999",
+        "--tempo.fee-token",
+        "0x0000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000001",
+    ])
+    .assert_success();
+});
+
+// Test that --tempo.expiring-nonce without --tempo.valid-before fails with a clap error
+casttest!(cast_mktx_tempo_expiring_nonce_requires_valid_before, |_prj, cmd| {
+    cmd.args([
+        "mktx",
+        "--private-key",
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "--chain",
+        "1",
+        "--nonce",
+        "0",
+        "--tempo.expiring-nonce",
+        "0x0000000000000000000000000000000000000001",
+    ])
+    .assert_failure();
+});
