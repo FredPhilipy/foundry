@@ -193,11 +193,8 @@ mod tests {
 
     #[test]
     fn test_apply_validity_window() {
-        let opts = TempoOpts {
-            valid_before: Some(2000),
-            valid_after: Some(1000),
-            ..Default::default()
-        };
+        let opts =
+            TempoOpts { valid_before: Some(2000), valid_after: Some(1000), ..Default::default() };
         let mut tx = default_tempo_tx();
         opts.apply::<TempoNetwork>(&mut tx, None);
 
