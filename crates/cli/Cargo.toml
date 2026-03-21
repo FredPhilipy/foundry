@@ -64,6 +64,7 @@ tracing-tracy = { version = "0.11", optional = true, features = ["demangle"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tempo-alloy.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }

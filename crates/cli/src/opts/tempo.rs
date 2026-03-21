@@ -135,3 +135,102 @@ impl TempoOpts {
 fn parse_signature(s: &str) -> Result<Signature, String> {
     Signature::from_str(s).map_err(|e| format!("invalid signature: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempo_alloy::TempoNetwork;
+
+    /// Helper: creates a default TempoNetwork transaction request.
+    fn default_tempo_tx() -> <TempoNetwork as Network>::TransactionRequest {
+        Default::default()
+    }
+
+    /// Helper: a valid 65-byte signature for testing.
+    fn test_signature() -> Signature {
+        Signature::from_str(
+            "f2dd00eac33840c04b6fc8a5ec8c4a47eff63575c2bc7312ecb269383de0c668\
+             045309c423484c8d097df306e690c653f8e1ec92f7f6f45d1f517027771c3e80\
+             1c",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_apply_expiring_nonce() {
+        let opts = TempoOpts {
+            expiring_nonce: true,
+            valid_before: Some(1000),
+            sequence_key: Some(U256::from(5)),
+            ..Default::default()
+        };
+        let mut tx = default_tempo_tx();
+        opts.apply::<TempoNetwork>(&mut tx, Some(42));
+
+        // Expiring nonce overrides both passed-in nonce and sequence_key
+        assert_eq!(tx.nonce(), Some(0));
+        assert_eq!(tx.nonce_key(), Some(U256::MAX));
+    }
+
+    #[test]
+    fn test_apply_fee_token_sequence_key_and_key_id() {
+        let fee_addr = Address::with_last_byte(0xAA);
+        let key_addr = Address::with_last_byte(0xBB);
+        let opts = TempoOpts {
+            fee_token: Some(fee_addr),
+            sequence_key: Some(U256::from(7)),
+            key_id: Some(key_addr),
+            ..Default::default()
+        };
+        let mut tx = default_tempo_tx();
+        opts.apply::<TempoNetwork>(&mut tx, Some(10));
+
+        assert_eq!(tx.fee_token(), Some(fee_addr));
+        assert_eq!(tx.nonce(), Some(10));
+        assert_eq!(tx.nonce_key(), Some(U256::from(7)));
+        assert_eq!(tx.key_id(), Some(key_addr));
+    }
+
+    #[test]
+    fn test_apply_validity_window() {
+        let opts = TempoOpts {
+            valid_before: Some(2000),
+            valid_after: Some(1000),
+            ..Default::default()
+        };
+        let mut tx = default_tempo_tx();
+        opts.apply::<TempoNetwork>(&mut tx, None);
+
+        assert_eq!(tx.valid_before(), Some(2000));
+        assert_eq!(tx.valid_after(), Some(1000));
+    }
+
+    #[test]
+    fn test_apply_sponsor_forces_aa() {
+        let sig = test_signature();
+
+        // Case 1: sponsor_signature without sequence_key forces nonce_key to ZERO
+        let opts = TempoOpts { sponsor_signature: Some(sig), ..Default::default() };
+        let mut tx = default_tempo_tx();
+        opts.apply::<TempoNetwork>(&mut tx, None);
+        assert_eq!(tx.nonce_key(), Some(U256::ZERO));
+        assert_eq!(tx.fee_payer_signature(), Some(sig));
+
+        // Case 2: print_sponsor_hash without sequence_key also forces nonce_key to ZERO
+        let opts = TempoOpts { print_sponsor_hash: true, ..Default::default() };
+        let mut tx = default_tempo_tx();
+        opts.apply::<TempoNetwork>(&mut tx, None);
+        assert_eq!(tx.nonce_key(), Some(U256::ZERO));
+
+        // Case 3: sponsor_signature with sequence_key preserves existing nonce_key
+        let opts = TempoOpts {
+            sponsor_signature: Some(sig),
+            sequence_key: Some(U256::from(5)),
+            ..Default::default()
+        };
+        let mut tx = default_tempo_tx();
+        opts.apply::<TempoNetwork>(&mut tx, None);
+        assert_eq!(tx.nonce_key(), Some(U256::from(5)));
+        assert_eq!(tx.fee_payer_signature(), Some(sig));
+    }
+}
