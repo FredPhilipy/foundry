@@ -33,7 +33,7 @@ use foundry_common::{
     mapping_slots::{MappingSlots, step as mapping_step},
 };
 use foundry_evm_core::{
-    Breakpoints, EthCheatCtx, EvmEnv, FoundryCfg, FoundryInspectorExt, FoundryTransaction,
+    Breakpoints, EthCheatCtx, EvmEnv, FoundryTransaction, InspectorExt,
     abi::Vm::stopExpectSafeMemoryCall,
     backend::{DatabaseError, DatabaseExt, RevertDiagnostic},
     constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS, MAGIC_ASSUME},
@@ -56,7 +56,7 @@ use revm::{
         result::EVMError,
     },
     context_interface::{CreateScheme, transaction::SignedAuthorization},
-    handler::FrameResult,
+    handler::{EvmTr, FrameResult},
     inspector::JournalExt,
     interpreter::{
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput, Gas,
@@ -89,7 +89,7 @@ pub trait CheatcodesExecutor<CTX: ContextTr> {
         &mut self,
         cheats: &mut Cheatcodes,
         ecx: &mut CTX,
-        f: NestedEvmClosure<'_, CTX::Block, CTX::Tx, <CTX::Cfg as Cfg>::Spec>,
+        f: NestedEvmClosure<'_, CTX::Tx>,
     ) -> Result<(), EVMError<DatabaseError>>;
 
     /// Replays a historical transaction on the database. Inspector is assembled internally.
@@ -117,9 +117,9 @@ pub trait CheatcodesExecutor<CTX: ContextTr> {
     fn with_fresh_nested_evm(
         &mut self,
         cheats: &mut Cheatcodes,
-        db: &mut dyn DatabaseExt<CTX::Block, CTX::Tx, <CTX::Cfg as Cfg>::Spec>,
+        db: &mut CTX::Db,
         evm_env: EvmEnv<<CTX::Cfg as Cfg>::Spec, CTX::Block>,
-        f: NestedEvmClosure<'_, CTX::Block, CTX::Tx, <CTX::Cfg as Cfg>::Spec>,
+        f: NestedEvmClosure<'_, CTX::Tx>,
     ) -> Result<EvmEnv<<CTX::Cfg as Cfg>::Spec, CTX::Block>, EVMError<DatabaseError>>;
 
     /// Simulates `console.log` invocation.
@@ -173,14 +173,14 @@ impl<CTX: EthCheatCtx> CheatcodesExecutor<CTX> for TransparentCheatcodesExecutor
         &mut self,
         cheats: &mut Cheatcodes,
         ecx: &mut CTX,
-        f: NestedEvmClosure<'_, CTX::Block, CTX::Tx, <CTX::Cfg as Cfg>::Spec>,
+        f: NestedEvmClosure<'_, CTX::Tx>,
     ) -> Result<(), EVMError<DatabaseError>> {
         with_cloned_context(ecx, |db, evm_env, journal_inner| {
             let mut evm = new_revm_with_inspector(db, evm_env, cheats);
             *evm.journal_inner_mut() = journal_inner;
             f(&mut evm)?;
             let sub_inner = evm.journaled_state.inner.clone();
-            let sub_evm_env = evm.to_evm_env();
+            let sub_evm_env = evm.ctx_ref().evm_clone();
             Ok((sub_evm_env, sub_inner))
         })
     }
@@ -188,13 +188,13 @@ impl<CTX: EthCheatCtx> CheatcodesExecutor<CTX> for TransparentCheatcodesExecutor
     fn with_fresh_nested_evm(
         &mut self,
         cheats: &mut Cheatcodes,
-        db: &mut dyn DatabaseExt<CTX::Block, CTX::Tx, <CTX::Cfg as Cfg>::Spec>,
-        evm_env: EvmEnv<<CTX::Cfg as Cfg>::Spec, CTX::Block>,
-        f: NestedEvmClosure<'_, CTX::Block, CTX::Tx, <CTX::Cfg as Cfg>::Spec>,
-    ) -> Result<EvmEnv<<CTX::Cfg as Cfg>::Spec, CTX::Block>, EVMError<DatabaseError>> {
+        db: &mut CTX::Db,
+        evm_env: EvmEnv<CTX::Spec, CTX::Block>,
+        f: NestedEvmClosure<'_, CTX::Tx>,
+    ) -> Result<EvmEnv<CTX::Spec, CTX::Block>, EVMError<DatabaseError>> {
         let mut evm = new_revm_with_inspector(db, evm_env, cheats);
         f(&mut evm)?;
-        Ok(evm.to_evm_env())
+        Ok(evm.ctx_ref().evm_clone())
     }
 
     fn transact_on_db(
@@ -575,7 +575,7 @@ pub struct Cheatcodes<
     /// Used to determine whether the broadcasted call has dynamic gas limit.
     pub dynamic_gas_limit: bool,
     // Custom execution evm version.
-    pub execution_evm_version: Option<<CTX::Cfg as FoundryCfg>::Spec>,
+    pub execution_evm_version: Option<CTX::Spec>,
 }
 
 // This is not derived because calling this in `fn new` with `..Default::default()` creates a second
@@ -1953,7 +1953,7 @@ impl<CTX: EthCheatCtx> Inspector<CTX> for Cheatcodes {
     }
 }
 
-impl FoundryInspectorExt for Cheatcodes {
+impl InspectorExt for Cheatcodes {
     fn should_use_create2_factory(&mut self, depth: usize, inputs: &CreateInputs) -> bool {
         if let CreateScheme::Create2 { .. } = inputs.scheme() {
             let target_depth = if let Some(prank) = &self.get_prank(depth) {

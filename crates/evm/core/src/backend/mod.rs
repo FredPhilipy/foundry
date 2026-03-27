@@ -1,7 +1,7 @@
 //! Foundry's main executor backend abstraction and implementation.
 
 use crate::{
-    EthInspectorExt, FoundryBlock, FoundryTransaction, TryAnyIntoTxEnv,
+    FoundryBlock, FoundryInspectorExt, FoundryTransaction, TryAnyToTxEnv,
     constants::{CALLER, CHEATCODE_ADDRESS, DEFAULT_CREATE2_DEPLOYER, TEST_CONTRACT_ADDRESS},
     evm::new_eth_evm_with_inspector,
     fork::{CreateFork, ForkId, MultiFork},
@@ -9,7 +9,7 @@ use crate::{
     utils::get_blob_base_fee_update_fraction,
 };
 use alloy_consensus::{BlockHeader, Typed2718};
-use alloy_evm::{Evm, EvmEnv};
+use alloy_evm::{Evm, EvmEnv, EvmFactory, eth::EthEvmContext};
 use alloy_genesis::GenesisAccount;
 use alloy_network::{AnyNetwork, BlockResponse, Network, TransactionResponse};
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256, uint};
@@ -23,7 +23,6 @@ use revm::{
     context::{BlockEnv, JournalInner, TxEnv},
     context_interface::{journaled_state::account::JournaledAccountTr, result::ResultAndState},
     database::{CacheDB, DatabaseRef},
-    inspector::NoOpInspector,
     precompile::{PrecompileSpecId, Precompiles},
     primitives::{HashMap as Map, KECCAK_EMPTY, Log, hardfork::SpecId},
     state::{Account, AccountInfo, EvmState, EvmStorageSlot},
@@ -191,7 +190,6 @@ pub trait DatabaseExt<BLOCK = BlockEnv, TX = TxEnv, SPEC = SpecId>:
         id: Option<LocalForkId>,
         block_number: u64,
         evm_env: &mut EvmEnv<SPEC, BLOCK>,
-        tx_env: &mut TX,
         journaled_state: &mut JournaledState,
     ) -> eyre::Result<()>;
 
@@ -208,7 +206,6 @@ pub trait DatabaseExt<BLOCK = BlockEnv, TX = TxEnv, SPEC = SpecId>:
         id: Option<LocalForkId>,
         transaction: B256,
         evm_env: &mut EvmEnv<SPEC, BLOCK>,
-        tx_env: &mut TX,
         journaled_state: &mut JournaledState,
     ) -> eyre::Result<()>;
 
@@ -220,7 +217,7 @@ pub trait DatabaseExt<BLOCK = BlockEnv, TX = TxEnv, SPEC = SpecId>:
         evm_env: EvmEnv<SPEC, BLOCK>,
         tx_env: TX,
         journaled_state: &mut JournaledState,
-        inspector: &mut dyn EthInspectorExt<BLOCK, TX, SPEC>,
+        inspector: &mut dyn for<'db> FoundryInspectorExt<EthEvmContext<&'db mut dyn DatabaseExt>>,
     ) -> eyre::Result<()>;
 
     /// Executes a given TransactionRequest, commits the new state to the DB
@@ -229,7 +226,7 @@ pub trait DatabaseExt<BLOCK = BlockEnv, TX = TxEnv, SPEC = SpecId>:
         tx_env: &TX,
         evm_env: EvmEnv<SPEC, BLOCK>,
         journaled_state: &mut JournaledState,
-        inspector: &mut dyn EthInspectorExt<BLOCK, TX, SPEC>,
+        inspector: &mut dyn for<'db> FoundryInspectorExt<EthEvmContext<&'db mut dyn DatabaseExt>>,
     ) -> eyre::Result<()>;
 
     /// Returns the `ForkId` that's currently used in the database, if fork mode is on
@@ -474,7 +471,7 @@ pub struct Backend<N: Network = AnyNetwork> {
 
 impl<N: Network> Backend<N>
 where
-    N::TxEnvelope: TryAnyIntoTxEnv,
+    N::TransactionResponse: TryAnyToTxEnv<TxEnv>,
 {
     /// Creates a new Backend with a spawned multi fork thread.
     ///
@@ -775,7 +772,7 @@ where
     /// Note: in case there are any cheatcodes executed that modify the environment, this will
     /// update the given `env` with the new values.
     #[instrument(name = "inspect", level = "debug", skip_all)]
-    pub fn inspect<I: EthInspectorExt>(
+    pub fn inspect<I: for<'db> FoundryInspectorExt<EthEvmContext<&'db mut dyn DatabaseExt>>>(
         &mut self,
         evm_env: &mut EvmEnv,
         tx_env: &mut TxEnv,
@@ -881,53 +878,66 @@ where
     pub fn replay_until(
         &mut self,
         id: LocalForkId,
-        mut evm_env: EvmEnv,
-        mut tx_env: TxEnv,
+        evm_env: EvmEnv,
         tx_hash: B256,
         journaled_state: &mut JournaledState,
     ) -> eyre::Result<Option<N::TransactionResponse>> {
         trace!(?id, ?tx_hash, "replay until transaction");
 
         let persistent_accounts = self.inner.persistent_accounts.clone();
-        let fork_id = self.ensure_fork_id(id)?.clone();
 
         let fork = self.inner.get_fork_by_id_mut(id)?;
         let full_block =
             fork.backend().get_full_block(evm_env.block_env.number.saturating_to::<u64>())?;
 
-        for tx in full_block.transactions().txns() {
-            // System transactions such as on L2s don't contain any pricing info so we skip them
-            // otherwise this would cause reverts
-            if is_known_system_sender(tx.from()) || tx.ty() == SYSTEM_TRANSACTION_TYPE {
-                trace!(tx=?tx.tx_hash(), "skipping system transaction");
-                continue;
-            }
+        // Collect non-system transactions up to and including the target.
+        let txs = full_block
+            .transactions()
+            .txns()
+            .filter(|tx| !is_known_system_sender(tx.from()) && tx.ty() != SYSTEM_TRANSACTION_TYPE);
 
+        let mut txs_to_replay = Vec::new();
+        let mut target_tx = None;
+        for tx in txs {
             if tx.tx_hash() == tx_hash {
-                // found the target transaction
-                return Ok(Some(tx.clone()));
+                target_tx = Some(tx.clone());
+                break;
             }
-            trace!(tx=?tx.tx_hash(), "committing transaction");
-
-            commit_transaction(
-                tx,
-                &mut evm_env,
-                &mut tx_env,
-                journaled_state,
-                fork,
-                &fork_id,
-                &persistent_accounts,
-                &mut NoOpInspector,
-            )?;
+            txs_to_replay.push(tx.clone());
         }
 
-        Ok(None)
+        // Replay all preceding transactions using a single EVM + cloned ForkDB.
+        if !txs_to_replay.is_empty() {
+            let now = Instant::now();
+
+            // Clone the fork's CacheDB once. The underlying SharedBackend is Arc-backed,
+            // so only the local cache layer is actually duplicated.
+            let replay_db = fork.db.clone();
+            let mut evm = alloy_evm::EthEvmFactory::default().create_evm(replay_db, evm_env);
+
+            for tx in &txs_to_replay {
+                let tx_env: TxEnv = tx.try_any_to_tx_env()?;
+                trace!(tx=?tx.tx_hash(), "committing transaction");
+                evm.transact_commit(tx_env).wrap_err("backend: failed committing transaction")?;
+            }
+
+            // Extract the DB back and replace the fork's database with the replayed state.
+            fork.db = evm.into_db();
+
+            // Refresh journaled states from the updated database, preserving persistent
+            // accounts (cheatcode address, CREATE2 deployer, test contract, etc.).
+            fork.refresh_journaled_states(journaled_state, &persistent_accounts)?;
+
+            trace!(elapsed=?now.elapsed(), count=txs_to_replay.len(), "replayed transactions");
+        }
+
+        Ok(target_tx)
     }
 }
 
 impl<N: Network> DatabaseExt for Backend<N>
 where
-    N::TxEnvelope: TryAnyIntoTxEnv,
+    N::TransactionResponse: TryAnyToTxEnv<TxEnv>,
 {
     fn snapshot_state(&mut self, journaled_state: &JournaledState, evm_env: &EvmEnv) -> U256 {
         trace!("create snapshot");
@@ -1043,7 +1053,6 @@ where
             Some(id),
             transaction,
             &mut evm_env,
-            &mut TxEnv::default(),
             &mut self.inner.new_journaled_state(),
         )?;
 
@@ -1188,7 +1197,6 @@ where
         id: Option<LocalForkId>,
         block_number: u64,
         evm_env: &mut EvmEnv,
-        tx_env: &mut TxEnv,
         journaled_state: &mut JournaledState,
     ) -> eyre::Result<()> {
         trace!(?id, ?block_number, "roll fork");
@@ -1203,7 +1211,7 @@ where
             if active_id == id {
                 // need to update the block's env settings right away, which is otherwise set when
                 // forks are selected `select_fork`
-                update_current_env_with_fork_env(evm_env, tx_env, fork_env);
+                *evm_env = fork_env;
 
                 // we also need to update the journaled_state right away, this has essentially the
                 // same effect as selecting (`select_fork`) by discarding
@@ -1253,7 +1261,6 @@ where
         id: Option<LocalForkId>,
         transaction: B256,
         evm_env: &mut EvmEnv,
-        tx_env: &mut TxEnv,
         journaled_state: &mut JournaledState,
     ) -> eyre::Result<()> {
         trace!(?id, ?transaction, "roll fork to transaction");
@@ -1265,7 +1272,7 @@ where
         // roll the fork to the transaction's parent block or latest if it's pending, because we
         // need to fork off the parent block's state for tx level forking and then replay the txs
         // before the tx in that block to get the state at the tx
-        self.roll_fork(Some(id), fork_block, evm_env, tx_env, journaled_state)?;
+        self.roll_fork(Some(id), fork_block, evm_env, journaled_state)?;
 
         // we need to update the env to the block
         update_env_block(evm_env, block.header());
@@ -1277,7 +1284,7 @@ where
             .update_block_env(self.inner.ensure_fork_id(id).cloned()?, evm_env.block_env.clone());
 
         // replay all transactions that came before
-        self.replay_until(id, evm_env.clone(), tx_env.clone(), transaction, journaled_state)?;
+        self.replay_until(id, evm_env.clone(), transaction, journaled_state)?;
 
         Ok(())
     }
@@ -1289,7 +1296,7 @@ where
         mut evm_env: EvmEnv,
         mut tx_env: TxEnv,
         journaled_state: &mut JournaledState,
-        inspector: &mut dyn EthInspectorExt,
+        inspector: &mut dyn for<'db> FoundryInspectorExt<EthEvmContext<&'db mut dyn DatabaseExt>>,
     ) -> eyre::Result<()> {
         trace!(?maybe_id, ?transaction, "execute transaction");
         let persistent_accounts = self.inner.persistent_accounts.clone();
@@ -1329,7 +1336,7 @@ where
         tx_env: &TxEnv,
         evm_env: EvmEnv,
         journaled_state: &mut JournaledState,
-        inspector: &mut dyn EthInspectorExt,
+        inspector: &mut dyn for<'db> FoundryInspectorExt<EthEvmContext<&'db mut dyn DatabaseExt>>,
     ) -> eyre::Result<()> {
         trace!(?tx_env, "execute signed transaction");
 
@@ -1515,7 +1522,7 @@ where
 
 impl<N: Network> DatabaseRef for Backend<N>
 where
-    N::TxEnvelope: TryAnyIntoTxEnv,
+    N::TransactionResponse: TryAnyToTxEnv<TxEnv>,
 {
     type Error = DatabaseError;
 
@@ -1554,7 +1561,7 @@ where
 
 impl<N: Network> DatabaseCommit for Backend<N>
 where
-    N::TxEnvelope: TryAnyIntoTxEnv,
+    N::TransactionResponse: TryAnyToTxEnv<TxEnv>,
 {
     fn commit(&mut self, changes: Map<Address, Account>) {
         if let Some(db) = self.active_fork_db_mut() {
@@ -1567,7 +1574,7 @@ where
 
 impl<N: Network> Database for Backend<N>
 where
-    N::TxEnvelope: TryAnyIntoTxEnv,
+    N::TransactionResponse: TryAnyToTxEnv<TxEnv>,
 {
     type Error = DatabaseError;
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
@@ -1633,6 +1640,18 @@ impl<N: Network> Fork<N> {
             return true;
         }
         is_contract_in_state(&self.journaled_state.state, acc)
+    }
+
+    /// Refreshes the given journaled state and the fork's own journaled state from the
+    /// database, preserving persistent accounts.
+    fn refresh_journaled_states(
+        &mut self,
+        journaled_state: &mut JournaledState,
+        persistent_accounts: &HashSet<Address>,
+    ) -> Result<(), BackendError> {
+        update_state(&mut journaled_state.state, &mut self.db, Some(persistent_accounts))?;
+        update_state(&mut self.journaled_state.state, &mut self.db, Some(persistent_accounts))?;
+        Ok(())
     }
 }
 
@@ -2006,12 +2025,12 @@ fn commit_transaction<N: Network>(
     fork: &mut Fork<N>,
     fork_id: &ForkId,
     persistent_accounts: &HashSet<Address>,
-    inspector: &mut dyn EthInspectorExt,
+    inspector: &mut dyn for<'db> FoundryInspectorExt<EthEvmContext<&'db mut dyn DatabaseExt>>,
 ) -> eyre::Result<()>
 where
-    N::TxEnvelope: TryAnyIntoTxEnv,
+    N::TransactionResponse: TryAnyToTxEnv<TxEnv>,
 {
-    *tx_env = tx.as_ref().try_into_tx_env(tx.from())?;
+    *tx_env = tx.try_any_to_tx_env()?;
 
     let now = Instant::now();
     let res = {
@@ -2061,11 +2080,7 @@ fn apply_state_changeset<N: Network>(
 ) -> Result<(), BackendError> {
     // commit the state and update the loaded accounts
     fork.db.commit(state);
-
-    update_state(&mut journaled_state.state, &mut fork.db, Some(persistent_accounts))?;
-    update_state(&mut fork.journaled_state.state, &mut fork.db, Some(persistent_accounts))?;
-
-    Ok(())
+    fork.refresh_journaled_states(journaled_state, persistent_accounts)
 }
 
 #[cfg(test)]
