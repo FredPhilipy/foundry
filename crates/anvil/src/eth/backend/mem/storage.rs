@@ -209,6 +209,20 @@ impl InMemoryBlockStates {
         }
     }
 
+    /// Removes states for the given block hashes.
+    ///
+    /// This is used during chain rollback to clean up states for blocks that are no longer part
+    /// of the canonical chain.
+    pub fn remove_block_states(&mut self, hashes: &[B256]) {
+        for hash in hashes {
+            self.states.remove(hash);
+            self.on_disk_states.remove(hash);
+            self.disk_cache.remove(*hash);
+        }
+        self.present.retain(|h| !hashes.contains(h));
+        self.oldest_on_disk.retain(|h| !hashes.contains(h));
+    }
+
     /// Serialize all states to a list of serializable historical states
     pub fn serialized_states(&mut self) -> SerializableHistoricalStates {
         // Get in-memory states
