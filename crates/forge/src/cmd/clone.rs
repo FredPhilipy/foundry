@@ -149,7 +149,9 @@ impl CloneArgs {
             SourceExplorer::Etherscan => {
                 let client = config
                     .get_etherscan_config_with_chain(Some(chain))?
-                    .ok_or_else(|| eyre::eyre!("No Etherscan API key configured for chain {chain}"))?
+                    .ok_or_else(|| {
+                        eyre::eyre!("No Etherscan API key configured for chain {chain}")
+                    })?
                     .into_client()?;
                 sh_println!("Downloading the source code of {address} from Etherscan...")?;
                 let meta = Self::collect_metadata_from_client(address, &client).await?;
@@ -178,9 +180,10 @@ impl CloneArgs {
 
         match source {
             SourceExplorer::Etherscan => {
-                let etherscan_config = config
-                    .get_etherscan_config_with_chain(Some(chain))?
-                    .ok_or_else(|| eyre::eyre!("No Etherscan API key configured for chain {chain}"))?;
+                let etherscan_config =
+                    config.get_etherscan_config_with_chain(Some(chain))?.ok_or_else(|| {
+                        eyre::eyre!("No Etherscan API key configured for chain {chain}")
+                    })?;
                 if etherscan_config.key.is_empty() {
                     sh_warn!("Waiting for 5 seconds to avoid rate limit...")?;
                     tokio::time::sleep(Duration::from_secs(5)).await;
