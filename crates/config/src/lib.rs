@@ -858,14 +858,14 @@ impl Config {
         config.normalize_hardfork_settings().map_err(ExtractConfigError::new)?;
 
         // Validate optimizer_runs does not exceed u32::MAX (Solidity compiler limit)
-        if let Some(runs) = config.optimizer_runs {
-            if runs > u32::MAX as usize {
-                return Err(ExtractConfigError::new(Error::from(format!(
-                    "`optimizer_runs` value {} exceeds maximum allowed value of {}",
-                    runs,
-                    u32::MAX
-                ))));
-            }
+        if let Some(runs) = config.optimizer_runs
+            && runs > u32::MAX as usize
+        {
+            return Err(ExtractConfigError::new(Error::from(format!(
+                "`optimizer_runs` value {} exceeds maximum allowed value of {}",
+                runs,
+                u32::MAX
+            ))));
         }
 
         Ok(config)
